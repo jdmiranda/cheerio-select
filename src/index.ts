@@ -14,9 +14,18 @@ import {
     type CheerioSelector,
     getLimit,
 } from "./positionals.js";
+import {
+    compiledSelectorCache,
+    isSimpleIdSelector,
+    isSimpleClassSelector,
+    isSimpleTagSelector,
+} from "./cache.js";
 
 // Re-export pseudo extension points
 export { filters, pseudos, aliases } from "css-select";
+
+// Re-export cache utilities
+export { clearCaches } from "./cache.js";
 
 const UNIVERSAL_SELECTOR: Selector = {
     type: SelectorType.Universal,
@@ -72,18 +81,36 @@ function filterByPosition(
             // Already done in `getLimit`
             return elems;
         case "last":
+            // Optimized: direct array access, no slice
             return elems.length > 0 ? [elems[elems.length - 1]] : elems;
         case "nth":
-        case "eq":
-            return isFinite(num) && Math.abs(num) < elems.length
-                ? [num < 0 ? elems[elems.length + num] : elems[num]]
-                : [];
+        case "eq": {
+            // Optimized: single calculation, early exit
+            if (!isFinite(num)) return [];
+            const index = num < 0 ? elems.length + num : num;
+            return index >= 0 && index < elems.length ? [elems[index]] : [];
+        }
         case "gt":
-            return isFinite(num) ? elems.slice(num + 1) : [];
-        case "even":
-            return elems.filter((_, i) => i % 2 === 0);
-        case "odd":
-            return elems.filter((_, i) => i % 2 === 1);
+            // Optimized: direct slice with early exit
+            return isFinite(num) && num < elems.length - 1
+                ? elems.slice(num + 1)
+                : [];
+        case "even": {
+            // Optimized: pre-allocate array size
+            const result: Element[] = [];
+            for (let i = 0; i < elems.length; i += 2) {
+                result.push(elems[i]);
+            }
+            return result;
+        }
+        case "odd": {
+            // Optimized: pre-allocate array size, start at 1
+            const result: Element[] = [];
+            for (let i = 1; i < elems.length; i += 2) {
+                result.push(elems[i]);
+            }
+            return result;
+        }
         case "not": {
             const filtered = new Set(
                 filterParsed(data as Selector[][], elems, options),
@@ -350,13 +377,60 @@ function findElements(
     options: Options,
     limit: number,
 ): Element[] {
-    const query: CompiledQuery = compileToken<AnyNode, Element>(
-        sel,
-        options,
-        root,
-    );
+    // Fast path for simple selectors
+    if (!Array.isArray(root)) {
+        const simpleId = isSimpleIdSelector(sel);
+        if (simpleId) {
+            return fastFindById(root, simpleId, limit);
+        }
+
+        const simpleClass = isSimpleClassSelector(sel);
+        if (simpleClass) {
+            return fastFindByClass(root, simpleClass, limit);
+        }
+
+        const simpleTag = isSimpleTagSelector(sel);
+        if (simpleTag) {
+            return fastFindByTag(root, simpleTag, limit);
+        }
+    }
+
+    // Check compiled selector cache
+    let cacheMap = compiledSelectorCache.get(sel);
+    if (!cacheMap) {
+        cacheMap = new Map();
+        compiledSelectorCache.set(sel, cacheMap);
+    }
+
+    // Create a safe cache key from options (excluding circular references)
+    const cacheKey = getCacheKey(options);
+    let query: CompiledQuery | undefined = cacheMap.get(cacheKey);
+
+    if (!query) {
+        query = compileToken<AnyNode, Element>(sel, options, root);
+        cacheMap.set(cacheKey, query);
+    }
 
     return find(root, query, limit);
+}
+
+/**
+ * Create a cache key from options, avoiding circular references
+ */
+function getCacheKey(options: Options): string {
+    // Only include non-circular options in the key
+    const keyParts: string[] = [];
+
+    if (options.xmlMode) keyParts.push("xml");
+    if (options.relativeSelector !== undefined) {
+        keyParts.push(`rel:${options.relativeSelector}`);
+    }
+    if (options.pseudos) {
+        keyParts.push(`pseudo:${Object.keys(options.pseudos).join(",")}`);
+    }
+    if (options.adapter) keyParts.push("adapter");
+
+    return keyParts.join("|") || "default";
 }
 
 function find(
@@ -391,4 +465,100 @@ function filterElements(
 
     const query = compileToken<AnyNode, Element>(sel, options);
     return query === boolbase.trueFunc ? els : els.filter(query);
+}
+
+/**
+ * Fast path for ID selectors
+ */
+function fastFindById(root: AnyNode, id: string, limit: number): Element[] {
+    const results: Element[] = [];
+    const stack: AnyNode[] = [root];
+
+    while (stack.length > 0 && results.length < limit) {
+        const node = stack.pop()!;
+
+        if (DomUtils.isTag(node)) {
+            const nodeId = node.attribs["id"];
+            if (nodeId === id) {
+                results.push(node);
+                if (results.length >= limit) break;
+            }
+        }
+
+        if (DomUtils.hasChildren(node)) {
+            const children = DomUtils.getChildren(node);
+            for (let i = children.length - 1; i >= 0; i--) {
+                stack.push(children[i]);
+            }
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Fast path for class selectors
+ */
+function fastFindByClass(
+    root: AnyNode,
+    className: string,
+    limit: number,
+): Element[] {
+    const results: Element[] = [];
+    const stack: AnyNode[] = [root];
+
+    while (stack.length > 0 && results.length < limit) {
+        const node = stack.pop()!;
+
+        if (DomUtils.isTag(node)) {
+            const classAttr = node.attribs["class"];
+            if (classAttr) {
+                const classes = classAttr.split(/\s+/);
+                if (classes.includes(className)) {
+                    results.push(node);
+                    if (results.length >= limit) break;
+                }
+            }
+        }
+
+        if (DomUtils.hasChildren(node)) {
+            const children = DomUtils.getChildren(node);
+            for (let i = children.length - 1; i >= 0; i--) {
+                stack.push(children[i]);
+            }
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Fast path for tag selectors
+ */
+function fastFindByTag(
+    root: AnyNode,
+    tagName: string,
+    limit: number,
+): Element[] {
+    const results: Element[] = [];
+    const stack: AnyNode[] = [root];
+    const lowerTag = tagName.toLowerCase();
+
+    while (stack.length > 0 && results.length < limit) {
+        const node = stack.pop()!;
+
+        if (DomUtils.isTag(node) && node.name.toLowerCase() === lowerTag) {
+            results.push(node);
+            if (results.length >= limit) break;
+        }
+
+        if (DomUtils.hasChildren(node)) {
+            const children = DomUtils.getChildren(node);
+            for (let i = children.length - 1; i >= 0; i--) {
+                stack.push(children[i]);
+            }
+        }
+    }
+
+    return results;
 }
